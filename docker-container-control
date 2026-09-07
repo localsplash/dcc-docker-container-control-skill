@@ -11,11 +11,12 @@ COMPOSE_NAMES = ['docker-compose.clawdydaapps.yml', 'docker-compose.yml', 'compo
 
 def usage(exit_code=2):
     print(
-        'Usage: sudo /opt/docker-container-control <list|status|restart|recreate|deploy|dry-run> [name]\n\n'
+        'Usage: sudo /opt/docker-container-control <list|status|stop|restart|recreate|deploy|dry-run> [name]\n\n'
         'Names are discovered from Docker compose labels and compose files under /opt.\n'
         'Use the folder-style name, compose project name, or running container name.\n\n'
         '  list              Show detected deployments.\n'
         '  status <name>     Show compose status for one deployment.\n'
+        '  stop <name>       docker compose stop for the deployment.\n'
         '  restart <name>    docker compose restart for the deployment.\n'
         '  recreate <name>   docker compose up -d --build --force-recreate.\n'
         '  deploy <name>     git pull --ff-only when applicable, pull images, build, restart.\n'
@@ -54,7 +55,10 @@ def compose_base():
 
 
 def compose(dep, extra, check=True, capture=False):
-    args = compose_base() + ['-p', dep['project'], '-f', dep['configs'][0]] + extra
+    config_args = []
+    for config in dep['configs']:
+        config_args.extend(['-f', config])
+    args = compose_base() + ['-p', dep['project']] + config_args + extra
     return run(args, cwd=dep['workdir'], check=check, capture=capture)
 
 
@@ -66,6 +70,10 @@ def compose_files_for(workdir, raw):
             continue
         path = item if os.path.isabs(item) else os.path.join(workdir, item)
         files.append(os.path.abspath(path))
+    if len(files) == 1 and os.path.basename(files[0]) == 'docker-compose.yml':
+        override = os.path.join(os.path.dirname(files[0]), 'docker-compose.override.yml')
+        if os.path.isfile(override):
+            files.append(os.path.abspath(override))
     return files
 
 
@@ -169,7 +177,8 @@ def discover():
             if dep['folder'] == folder or path in dep['configs']:
                 project = dep['project']
                 break
-        add(deployments, alias=alias, project=project, workdir=root, configs=[path], source='opt-scan')
+        configs = compose_files_for(root, path)
+        add(deployments, alias=alias, project=project, workdir=root, configs=configs, source='opt-scan')
     result = []
     for dep in deployments.values():
         dep['services'] = sorted(dep['services'])
@@ -180,7 +189,29 @@ def discover():
     return sorted(result, key=lambda d: d['name'])
 
 
+def canonical_name(value):
+    return ''.join(char for char in value.lower() if char.isalnum())
+
+
 def select(name):
+    # A source checkout may include a standalone Compose file while its running
+    # container is actually owned by a sibling orchestrator stack. Prefer the
+    # running owner when the requested folder matches one of its service names.
+    requested = canonical_name(name)
+    for dep in discover():
+        target_service = next(
+            (service for service in dep['services'] if canonical_name(service) == requested),
+            None,
+        )
+        if dep['containers'] and target_service:
+            source_folder = os.path.join(os.path.dirname(dep['workdir']), name)
+            if os.path.isdir(os.path.join(source_folder, '.git')):
+                routed = dict(dep)
+                routed['name'] = name
+                routed['folder'] = source_folder
+                routed['target_service'] = target_service
+                return routed
+
     matches = []
     for dep in discover():
         aliases = set(dep['aliases']) | {c['name'] for c in dep['containers']}
@@ -210,21 +241,31 @@ def list_projects():
 
 
 def wait_healthy(dep):
-    names = [c['name'] for c in dep['containers']]
+    target = dep.get('target_service')
+    names = [
+        c['name'] for c in dep['containers']
+        if not target or c['service'] == target
+    ]
     if not names:
         return True
     deadline = time.time() + 120
     while time.time() < deadline:
         ok = True
         for name in names:
-            proc = run(['docker', 'inspect', name, '--format', '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'], capture=True)
+            proc = run([
+                'docker', 'inspect', name, '--format',
+                '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.ExitCode}}',
+            ], capture=True)
             if proc.returncode != 0:
                 ok = False
                 continue
             parts = proc.stdout.strip().split()
             state = parts[0] if parts else ''
             health = parts[1] if len(parts) > 1 else 'none'
-            if state != 'running' or health not in ('healthy', 'none'):
+            exit_code = int(parts[2]) if len(parts) > 2 else -1
+            running_ok = state == 'running' and health in ('healthy', 'none')
+            completed_ok = state == 'exited' and exit_code == 0
+            if not (running_ok or completed_ok):
                 ok = False
         if ok:
             return True
@@ -233,12 +274,23 @@ def wait_healthy(dep):
 
 
 def status(dep):
-    compose(dep, ['ps'])
+    args = ['ps']
+    if dep.get('target_service'):
+        args.append(dep['target_service'])
+    compose(dep, args)
 
 
-def git_clean(folder):
-    proc = run(['git', '-C', folder, 'status', '--porcelain', '--untracked-files=no'], capture=True)
-    return proc.returncode == 0 and not proc.stdout.strip()
+def git_clean(folder, attempts=3):
+    args = ['git', '-C', folder, 'status', '--porcelain', '--untracked-files=no']
+    for attempt in range(1, attempts + 1):
+        proc = run(args, capture=True)
+        if proc.returncode == 0:
+            return not proc.stdout.strip()
+        if attempt < attempts:
+            time.sleep(1)
+
+    detail = (proc.stderr or proc.stdout or 'unknown Git error').strip()
+    fail(f"could not inspect Git status for {folder}: {detail}")
 
 
 def deploy(dep, dry=False):
@@ -247,6 +299,9 @@ def deploy(dep, dry=False):
     print(f"Compose project: {dep['project']}")
     print(f"Working dir: {dep['workdir']}")
     print(f"Compose file: {dep['configs'][0]}")
+    target = dep.get('target_service')
+    if target:
+        print(f"Service: {target}")
     if os.path.isdir(os.path.join(dep['folder'], '.git')):
         if not git_clean(dep['folder']):
             fail(f"{dep['folder']} has uncommitted changes; refusing to deploy")
@@ -259,8 +314,13 @@ def deploy(dep, dry=False):
     print('Compose: pull --ignore-pull-failures; up -d --build')
     if dry:
         return
-    compose(dep, ['pull', '--ignore-pull-failures'], check=False)
-    compose(dep, ['up', '-d', '--build'])
+    pull_args = ['pull', '--ignore-pull-failures']
+    up_args = ['up', '-d', '--build']
+    if target:
+        pull_args.append(target)
+        up_args.extend(['--no-deps', '--force-recreate', target])
+    compose(dep, pull_args, check=False)
+    compose(dep, up_args)
     refreshed = select(dep['name'])
     if not wait_healthy(refreshed):
         status(refreshed)
@@ -284,15 +344,27 @@ def main():
     dep = select(sys.argv[2])
     if action == 'status':
         status(dep)
+    elif action == 'stop':
+        args = ['stop']
+        if dep.get('target_service'):
+            args.append(dep['target_service'])
+        compose(dep, args)
+        status(dep)
     elif action == 'restart':
-        compose(dep, ['restart'])
+        args = ['restart']
+        if dep.get('target_service'):
+            args.append(dep['target_service'])
+        compose(dep, args)
         refreshed = select(dep['name'])
         if not wait_healthy(refreshed):
             print('ERROR: deployment did not become healthy/running in time', file=sys.stderr)
             raise SystemExit(1)
         status(refreshed)
     elif action == 'recreate':
-        compose(dep, ['up', '-d', '--build', '--force-recreate'])
+        args = ['up', '-d', '--build', '--force-recreate']
+        if dep.get('target_service'):
+            args.extend(['--no-deps', dep['target_service']])
+        compose(dep, args)
         refreshed = select(dep['name'])
         if not wait_healthy(refreshed):
             print('ERROR: deployment did not become healthy/running in time', file=sys.stderr)
@@ -308,4 +380,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
