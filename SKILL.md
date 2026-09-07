@@ -60,6 +60,7 @@ If an existing remote controller differs from the bundled version, do not silent
 - `dcc dry-run <app>` — show the Git and Compose deployment plan without changing containers.
 - `dcc list` — list detected deployments and usable app names.
 - `dcc status <app>` — show Compose status.
+- `dcc stop <app>` — stop the existing Compose deployment and show its final status.
 - `dcc restart <app>` — restart the existing Compose deployment and verify health.
 - `dcc recreate <app>` — rebuild and force-recreate the Compose deployment, then verify health.
 
