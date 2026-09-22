@@ -13,7 +13,9 @@ def usage(exit_code=2):
     print(
         'Usage: sudo /opt/docker-container-control <list|status|stop|restart|recreate|deploy|dry-run> [name]\n\n'
         'Names are discovered from Docker compose labels and compose files under /opt.\n'
-        'Use the folder-style name, compose project name, or running container name.\n\n'
+        'Use the folder-style name, compose project name, or running container name.\n'
+        'A folder\'s .env COMPOSE_FILE (and COMPOSE_PATH_SEPARATOR) picks its Compose files,\n'
+        'as it does for docker compose itself.\n\n'
         '  list              Show detected deployments.\n'
         '  status <name>     Show compose status for one deployment.\n'
         '  stop <name>       docker compose stop for the deployment.\n'
@@ -31,8 +33,8 @@ def fail(message, exit_code=2):
     usage(exit_code)
 
 
-def run(args, cwd=None, check=False, capture=True):
-    kwargs = {'cwd': cwd, 'text': True}
+def run(args, cwd=None, check=False, capture=True, env=None):
+    kwargs = {'cwd': cwd, 'text': True, 'env': env}
     if capture:
         kwargs.update({'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE})
     proc = subprocess.run(args, **kwargs)
@@ -59,7 +61,58 @@ def compose(dep, extra, check=True, capture=False):
     for config in dep['configs']:
         config_args.extend(['-f', config])
     args = compose_base() + ['-p', dep['project']] + config_args + extra
-    return run(args, cwd=dep['workdir'], check=check, capture=capture)
+    env = os.environ.copy()
+    git_dir = os.path.join(dep['folder'], '.git')
+    if os.path.isdir(git_dir):
+        revision = run(['git', '-C', dep['folder'], 'rev-parse', 'HEAD'], capture=True)
+        epoch = run(['git', '-C', dep['folder'], 'show', '-s', '--format=%ct', 'HEAD'], capture=True)
+        dirty = run(['git', '-C', dep['folder'], 'status', '--porcelain'], capture=True)
+        if revision.returncode == 0:
+            env['BUILD_REVISION'] = revision.stdout.strip()
+        if epoch.returncode == 0:
+            env['SOURCE_DATE_EPOCH'] = epoch.stdout.strip()
+        if dirty.returncode == 0:
+            env['BUILD_DIRTY'] = 'true' if dirty.stdout.strip() else 'false'
+    return run(args, cwd=dep['workdir'], check=check, capture=capture, env=env)
+
+
+def dotenv_value(folder, key):
+    """KEY's value in folder/.env, parsed the way docker compose reads it."""
+    try:
+        with open(os.path.join(folder, '.env'), encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    value = None
+    for line in lines:
+        line = line.strip()
+        if line.startswith('export '):
+            line = line[len('export '):].lstrip()
+        name, sep, raw = line.partition('=')
+        if not sep or name.strip() != key:
+            continue
+        raw = raw.strip()
+        if raw[:1] in ('"', "'") and raw[0] in raw[1:]:
+            raw = raw[1:raw.index(raw[0], 1)]  # quoted; anything after is a comment
+        else:
+            raw = raw.split(' #', 1)[0].strip()
+        value = raw  # the last definition wins
+    return value
+
+
+def env_compose_files(folder):
+    """The folder's .env COMPOSE_FILE list, resolved against the folder.
+
+    docker compose uses it instead of its default file names whenever it runs
+    in that folder without -f. This controller always passes -f, so it has to
+    apply COMPOSE_FILE itself or an overlay named there would silently drop out.
+    """
+    raw = dotenv_value(folder, 'COMPOSE_FILE')
+    if not raw:
+        return None
+    separator = dotenv_value(folder, 'COMPOSE_PATH_SEPARATOR') or os.pathsep
+    files = [item.strip() for item in raw.split(separator) if item.strip()]
+    return [os.path.abspath(os.path.join(folder, item)) for item in files] or None
 
 
 def compose_files_for(workdir, raw):
@@ -163,21 +216,28 @@ def discover():
     for root, dirs, files in os.walk(opt):
         rel = os.path.relpath(root, opt)
         depth = 0 if rel == '.' else rel.count(os.sep) + 1
-        if depth > 2:
+        if depth > 3:
             dirs[:] = []
             continue
+        env_files = env_compose_files(root)
         compose_file = next((name for name in COMPOSE_NAMES if name in files), None)
-        if not compose_file:
+        if not env_files and not compose_file:
             continue
-        path = os.path.abspath(os.path.join(root, compose_file))
+        if env_files:
+            missing = [f for f in env_files if not os.path.isfile(f)]
+            if missing:
+                print(f"WARNING: {os.path.join(root, '.env')} COMPOSE_FILE names missing file(s): "
+                      + ', '.join(missing), file=sys.stderr)
+                continue
+        path = env_files[0] if env_files else os.path.abspath(os.path.join(root, compose_file))
         folder = package_root(root)
         alias = os.path.basename(folder)
-        project = alias
+        project = alias.lower()
         for dep in deployments.values():
             if dep['folder'] == folder or path in dep['configs']:
                 project = dep['project']
                 break
-        configs = compose_files_for(root, path)
+        configs = env_files or compose_files_for(root, path)
         add(deployments, alias=alias, project=project, workdir=root, configs=configs, source='opt-scan')
     result = []
     for dep in deployments.values():
@@ -194,11 +254,25 @@ def canonical_name(value):
 
 
 def select(name):
+    deployments = discover()
+
+    # Exact running container names are the strongest identifiers.
+    exact_name_matches = [dep for dep in deployments if dep["name"] == name]
+    exact_nonrunning = [dep for dep in exact_name_matches if not dep["containers"]]
+    if len(exact_nonrunning) == 1:
+        return exact_nonrunning[0]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+
+    container_matches = [dep for dep in deployments if any(c["name"] == name for c in dep["containers"])]
+    if len(container_matches) == 1:
+        return container_matches[0]
+
     # A source checkout may include a standalone Compose file while its running
     # container is actually owned by a sibling orchestrator stack. Prefer the
     # running owner when the requested folder matches one of its service names.
     requested = canonical_name(name)
-    for dep in discover():
+    for dep in deployments:
         target_service = next(
             (service for service in dep['services'] if canonical_name(service) == requested),
             None,
@@ -213,12 +287,12 @@ def select(name):
                 return routed
 
     matches = []
-    for dep in discover():
+    for dep in deployments:
         aliases = set(dep['aliases']) | {c['name'] for c in dep['containers']}
         if name in aliases:
             matches.append(dep)
     if not matches:
-        detected = ', '.join(dep['name'] for dep in discover()) or '(none)'
+        detected = ', '.join(dep['name'] for dep in deployments) or '(none)'
         print(f"ERROR: no deployment matched '{name}'", file=sys.stderr)
         print(f'Detected names: {detected}', file=sys.stderr)
         raise SystemExit(3)
@@ -298,7 +372,8 @@ def deploy(dep, dry=False):
     print(f"Folder: {dep['folder']}")
     print(f"Compose project: {dep['project']}")
     print(f"Working dir: {dep['workdir']}")
-    print(f"Compose file: {dep['configs'][0]}")
+    label = 'Compose file' if len(dep['configs']) == 1 else 'Compose files'
+    print(f"{label}: {', '.join(dep['configs'])}")
     target = dep.get('target_service')
     if target:
         print(f"Service: {target}")
@@ -321,7 +396,7 @@ def deploy(dep, dry=False):
         up_args.extend(['--no-deps', '--force-recreate', target])
     compose(dep, pull_args, check=False)
     compose(dep, up_args)
-    refreshed = select(dep['name'])
+    refreshed = select(sys.argv[2])
     if not wait_healthy(refreshed):
         status(refreshed)
         print('ERROR: deployment did not become healthy/running in time', file=sys.stderr)
@@ -355,7 +430,7 @@ def main():
         if dep.get('target_service'):
             args.append(dep['target_service'])
         compose(dep, args)
-        refreshed = select(dep['name'])
+        refreshed = select(sys.argv[2])
         if not wait_healthy(refreshed):
             print('ERROR: deployment did not become healthy/running in time', file=sys.stderr)
             raise SystemExit(1)
@@ -365,7 +440,7 @@ def main():
         if dep.get('target_service'):
             args.extend(['--no-deps', dep['target_service']])
         compose(dep, args)
-        refreshed = select(dep['name'])
+        refreshed = select(sys.argv[2])
         if not wait_healthy(refreshed):
             print('ERROR: deployment did not become healthy/running in time', file=sys.stderr)
             raise SystemExit(1)
