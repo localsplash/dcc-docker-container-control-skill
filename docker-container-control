@@ -48,6 +48,17 @@ def run(args, cwd=None, check=False, capture=True, env=None):
     return proc
 
 
+def git_args(folder, *args):
+    """git for a checkout this process does not own.
+
+    The deployments under /opt belong to the account that develops them, not to
+    root, and git refuses a repository whose owner differs ("dubious
+    ownership"). Trust exactly the folder being deployed, rather than adding
+    entries to root's global config.
+    """
+    return ['git', '-c', f'safe.directory={os.path.abspath(folder)}', '-C', folder, *args]
+
+
 def compose_base():
     if run(['docker', 'compose', 'version'], capture=True).returncode == 0:
         return ['docker', 'compose']
@@ -64,9 +75,9 @@ def compose(dep, extra, check=True, capture=False):
     env = os.environ.copy()
     git_dir = os.path.join(dep['folder'], '.git')
     if os.path.isdir(git_dir):
-        revision = run(['git', '-C', dep['folder'], 'rev-parse', 'HEAD'], capture=True)
-        epoch = run(['git', '-C', dep['folder'], 'show', '-s', '--format=%ct', 'HEAD'], capture=True)
-        dirty = run(['git', '-C', dep['folder'], 'status', '--porcelain'], capture=True)
+        revision = run(git_args(dep['folder'], 'rev-parse', 'HEAD'), capture=True)
+        epoch = run(git_args(dep['folder'], 'show', '-s', '--format=%ct', 'HEAD'), capture=True)
+        dirty = run(git_args(dep['folder'], 'status', '--porcelain'), capture=True)
         if revision.returncode == 0:
             env['BUILD_REVISION'] = revision.stdout.strip()
         if epoch.returncode == 0:
@@ -369,7 +380,7 @@ def status(dep):
 
 
 def git_clean(folder, attempts=3):
-    args = ['git', '-C', folder, 'status', '--porcelain', '--untracked-files=no']
+    args = git_args(folder, 'status', '--porcelain', '--untracked-files=no')
     for attempt in range(1, attempts + 1):
         proc = run(args, capture=True)
         if proc.returncode == 0:
@@ -396,8 +407,8 @@ def deploy(dep, dry=False):
             fail(f"{dep['folder']} has uncommitted changes; refusing to deploy")
         print('Git: fetch --prune origin; pull --ff-only')
         if not dry:
-            run(['git', '-C', dep['folder'], 'fetch', '--prune', 'origin'], check=True, capture=False)
-            run(['git', '-C', dep['folder'], 'pull', '--ff-only'], check=True, capture=False)
+            run(git_args(dep['folder'], 'fetch', '--prune', 'origin'), check=True, capture=False)
+            run(git_args(dep['folder'], 'pull', '--ff-only'), check=True, capture=False)
     else:
         print('Git: skipped, folder is not a git checkout.')
     print('Compose: pull --ignore-pull-failures; up -d --build')
