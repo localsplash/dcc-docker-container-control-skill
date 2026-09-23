@@ -256,35 +256,49 @@ def canonical_name(value):
 def select(name):
     deployments = discover()
 
-    # Exact running container names are the strongest identifiers.
-    exact_name_matches = [dep for dep in deployments if dep["name"] == name]
-    exact_nonrunning = [dep for dep in exact_name_matches if not dep["containers"]]
-    if len(exact_nonrunning) == 1:
-        return exact_nonrunning[0]
-    if len(exact_name_matches) == 1:
-        return exact_name_matches[0]
-
-    container_matches = [dep for dep in deployments if any(c["name"] == name for c in dep["containers"])]
-    if len(container_matches) == 1:
-        return container_matches[0]
-
-    # A source checkout may include a standalone Compose file while its running
-    # container is actually owned by a sibling orchestrator stack. Prefer the
-    # running owner when the requested folder matches one of its service names.
+    # A source checkout often carries a standalone Compose file for running that
+    # one service by itself, while the service that is actually deployed belongs
+    # to a stack next to it. Route to the running owner first: `deploy EchoWeb`
+    # has to mean the EchoWeb that is serving, not a second copy started from
+    # the repo's own file with its own database and ports. The checkout is still
+    # where the Git pull and the build happen — only the Compose project and
+    # file come from the running deployment.
     requested = canonical_name(name)
     for dep in deployments:
         target_service = next(
             (service for service in dep['services'] if canonical_name(service) == requested),
             None,
         )
-        if dep['containers'] and target_service:
-            source_folder = os.path.join(os.path.dirname(dep['workdir']), name)
-            if os.path.isdir(os.path.join(source_folder, '.git')):
+        if not (dep['containers'] and target_service):
+            continue
+        # The checkout sits either inside the stack folder (/opt/local/echo/EchoWeb)
+        # or beside it (the older layout). If it *is* the stack folder, there is
+        # nothing to route: the exact-name match below deploys the whole project.
+        for candidate in (os.path.join(dep['workdir'], name),
+                          os.path.join(os.path.dirname(dep['workdir']), name)):
+            if os.path.abspath(candidate) == os.path.abspath(dep['workdir']):
+                continue
+            if os.path.isdir(os.path.join(candidate, '.git')):
                 routed = dict(dep)
                 routed['name'] = name
-                routed['folder'] = source_folder
+                routed['folder'] = os.path.abspath(candidate)
                 routed['target_service'] = target_service
                 return routed
+
+    # Then exact names, the running one first for the same reason.
+    exact_name_matches = [dep for dep in deployments if dep["name"] == name]
+    exact_running = [dep for dep in exact_name_matches if dep["containers"]]
+    if len(exact_running) == 1:
+        return exact_running[0]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    exact_nonrunning = [dep for dep in exact_name_matches if not dep["containers"]]
+    if len(exact_nonrunning) == 1:
+        return exact_nonrunning[0]
+
+    container_matches = [dep for dep in deployments if any(c["name"] == name for c in dep["containers"])]
+    if len(container_matches) == 1:
+        return container_matches[0]
 
     matches = []
     for dep in deployments:
