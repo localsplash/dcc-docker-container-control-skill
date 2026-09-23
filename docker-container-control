@@ -80,6 +80,9 @@ def compose(dep, extra, check=True, capture=False):
         dirty = run(git_args(dep['folder'], 'status', '--porcelain'), capture=True)
         if revision.returncode == 0:
             env['BUILD_REVISION'] = revision.stdout.strip()
+            # Short form for image tags: Compose can interpolate a variable but
+            # cannot shorten one.
+            env['BUILD_REVISION_SHORT'] = revision.stdout.strip()[:12]
         if epoch.returncode == 0:
             env['SOURCE_DATE_EPOCH'] = epoch.stdout.strip()
         if dirty.returncode == 0:

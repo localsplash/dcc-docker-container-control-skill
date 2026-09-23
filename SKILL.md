@@ -86,7 +86,7 @@ For a Git checkout, `deploy`:
 
 A non-Git app skips the Git step and still pulls/builds/starts the Compose deployment.
 
-The Compose files are the ones the app's folder would use with plain `docker compose`. When the folder's `.env` sets `COMPOSE_FILE` (split on `COMPOSE_PATH_SEPARATOR`, default `:`), those files are used, such as an opt-in overlay that joins a reverse-proxy network. Otherwise the controller uses the folder's `compose.yaml`/`docker-compose.yml` (plus `docker-compose.override.yml`) or the files a running deployment was started with. For Git checkouts, builds also receive `BUILD_REVISION`, `SOURCE_DATE_EPOCH` and `BUILD_DIRTY` from the checkout.
+The Compose files are the ones the app's folder would use with plain `docker compose`. When the folder's `.env` sets `COMPOSE_FILE` (split on `COMPOSE_PATH_SEPARATOR`, default `:`), those files are used, such as an opt-in overlay that joins a reverse-proxy network. Otherwise the controller uses the folder's `compose.yaml`/`docker-compose.yml` (plus `docker-compose.override.yml`) or the files a running deployment was started with. For Git checkouts, builds also receive `BUILD_REVISION`, `BUILD_REVISION_SHORT` (the first 12 characters, for image tags), `SOURCE_DATE_EPOCH` and `BUILD_DIRTY` from the checkout. When a name matches both a checkout's own Compose file and a running deployment that owns a service of that name, the running deployment wins: a deploy updates what is serving instead of starting a second copy.
 
 ## Reporting
 
